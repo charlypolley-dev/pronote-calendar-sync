@@ -1,5 +1,6 @@
 import base64
 import datetime
+import hashlib
 import json
 import os
 import sys
@@ -140,7 +141,7 @@ def main():
     cal.add('x-wr-caldesc', 'Emploi du temps synchronisé automatiquement depuis Pronote avec gestion des absences.')
     cal.add_component(build_vtimezone())
 
-    # Plage de dates : du début de l'année scolaire (1er sept) jusqu'à mi-novembre (~75 jours)
+    # Plage de dates : du début de l'année scolaire jusqu'à dans 10 semaines
     today = datetime.date.today()
     start_date = client.start_day if hasattr(client, 'start_day') and client.start_day else (today - datetime.timedelta(days=14))
     end_date = today + datetime.timedelta(days=70)
@@ -157,11 +158,12 @@ def main():
 
     canceled_count = 0
     now_utc = datetime.datetime.now(datetime.timezone.utc)
+    seen_uids = set()
 
-    for lesson in lessons:
+    for idx, lesson in enumerate(lessons):
         event = Event()
         
-        # 1. Gestion des dates avec fuseau horaire explicite Europe/Paris
+        # 1. Fuseau horaire Europe/Paris
         start_dt = lesson.start
         end_dt = lesson.end
         
@@ -174,10 +176,19 @@ def main():
         event.add('dtend', end_dt)
         event.add('dtstamp', now_utc)
 
-        # 2. UID stable et persistant
+        # 2. UID 100% UNIQUE PAR INSTANCE DE COURS (CRITIQUE POUR APPLE CALENDAR !)
+        # Si les UIDs ne sont pas uniques par date/heure, Apple Calendar écrase tous les cours !
         subj_clean = lesson.subject.name if lesson.subject else "Cours"
-        uid_base = lesson.id if lesson.id else f"{lesson.start.strftime('%Y%m%d%H%M')}-{subj_clean}"
-        lesson_uid = f"pronote-{uid_base}@pronote-sync"
+        time_slot = start_dt.strftime('%Y%m%d%H%M')
+        raw_uid_str = f"{lesson.id}_{time_slot}_{subj_clean}"
+        uid_hash = hashlib.md5(raw_uid_str.encode('utf-8')).hexdigest()
+        lesson_uid = f"pronote-{time_slot}-{uid_hash[:12]}@pronote-sync"
+        
+        # Sécurité anti-doublon absolu
+        if lesson_uid in seen_uids:
+            lesson_uid = f"pronote-{time_slot}-{uid_hash[:12]}-{idx}@pronote-sync"
+        seen_uids.add(lesson_uid)
+
         event.add('uid', lesson_uid)
 
         # 3. Formatage du Titre (SUMMARY)
@@ -186,9 +197,11 @@ def main():
             motif_court = f" ({lesson.status})" if lesson.status else ""
             event.add('summary', f"❌ [ANNULÉ] {subj_clean}{motif_court}")
             event.add('status', 'CANCELLED')
+            event.add('transp', 'TRANSPARENT')
         else:
             event.add('summary', subj_clean)
             event.add('status', 'CONFIRMED')
+            event.add('transp', 'OPAQUE')
 
         # 4. Lieu / Salle (LOCATION)
         if lesson.classroom:
@@ -231,7 +244,7 @@ def main():
         f.write(cal.to_ical())
 
     print(f"🎉 Fichier '{output_path}' généré avec succès !")
-    print(f"📊 Bilan : {len(lessons)} cours (dont {canceled_count} cours annulés).")
+    print(f"📊 Bilan : {len(lessons)} cours (tous avec UID unique). Dont {canceled_count} cours annulés.")
 
 if __name__ == "__main__":
     main()
