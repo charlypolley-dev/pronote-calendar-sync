@@ -140,10 +140,10 @@ def main():
     cal.add('x-wr-caldesc', 'Emploi du temps synchronisé automatiquement depuis Pronote avec gestion des absences.')
     cal.add_component(build_vtimezone())
 
-    # Plage de dates : du début de l'année scolaire jusqu'à dans 10 semaines (~70 jours)
+    # Plage de dates : du début de l'année scolaire (1er sept) jusqu'à mi-novembre (~75 jours)
     today = datetime.date.today()
     start_date = client.start_day if hasattr(client, 'start_day') and client.start_day else (today - datetime.timedelta(days=14))
-    end_date = today + datetime.timedelta(days=70) # 10 semaines dans le futur
+    end_date = today + datetime.timedelta(days=70)
 
     print(f"📅 Récupération intégrale des cours du {start_date.strftime('%d/%m/%Y')} au {end_date.strftime('%d/%m/%Y')}...")
     
@@ -151,7 +151,6 @@ def main():
         lessons = client.lessons(start_date, end_date)
     except Exception as e:
         print(f"⚠️ Erreur lors de la récupération : {e}")
-        # Fallback 4 semaines
         lessons = client.lessons(today - datetime.timedelta(days=7), today + datetime.timedelta(days=28))
 
     print(f"✨ {len(lessons)} cours récupérés au total.")
@@ -175,7 +174,7 @@ def main():
         event.add('dtend', end_dt)
         event.add('dtstamp', now_utc)
 
-        # 2. UID stable et persistant pour qu'Apple Calendar mette à jour sans doublon
+        # 2. UID stable et persistant
         subj_clean = lesson.subject.name if lesson.subject else "Cours"
         uid_base = lesson.id if lesson.id else f"{lesson.start.strftime('%Y%m%d%H%M')}-{subj_clean}"
         lesson_uid = f"pronote-{uid_base}@pronote-sync"
@@ -193,14 +192,18 @@ def main():
 
         # 4. Lieu / Salle (LOCATION)
         if lesson.classroom:
-            event.add('location', f"Salle {lesson.classroom}")
+            room = lesson.classroom.strip()
+            if room.lower().startswith("salle") or room.lower().startswith("tp") or room.lower().startswith("labo"):
+                event.add('location', room)
+            else:
+                event.add('location', f"Salle {room}")
         elif "SPORT" in subj_clean.upper() or "EPS" in subj_clean.upper():
             event.add('location', "Gymnase / EPS")
 
-        # 5. Description enrichie et lisible (DESCRIPTION)
+        # 5. Description enrichie et structurée
         desc_lines = []
         if lesson.canceled:
-            desc_lines.append(f"❌ COURS ANNULÉ")
+            desc_lines.append("❌ COURS ANNULÉ")
             if lesson.status:
                 desc_lines.append(f"⚠️ Motif : {lesson.status}")
             desc_lines.append("─────────────────────")
