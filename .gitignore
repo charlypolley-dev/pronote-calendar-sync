@@ -1,5 +1,6 @@
 # Secrets
 credentials.json
+.secret_key
 *.png
 *.jpg
 

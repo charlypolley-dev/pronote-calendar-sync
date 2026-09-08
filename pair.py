@@ -1,11 +1,35 @@
+import base64
+import datetime
 import json
 import os
+import subprocess
 import sys
 import uuid
 import cv2
 import pronotepy
+from Crypto.Cipher import AES
+from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Random import get_random_bytes
 
 CREDENTIALS_FILE = "credentials.json"
+ENCRYPTED_FILE = "credentials.enc"
+
+def derive_key(passphrase: str, salt: bytes) -> bytes:
+    return PBKDF2(passphrase, salt, dkLen=32, count=1000)
+
+def encrypt_data(data: dict, passphrase: str) -> str:
+    raw = json.dumps(data).encode("utf-8")
+    salt = get_random_bytes(16)
+    key = derive_key(passphrase, salt)
+    cipher = AES.new(key, AES.MODE_GCM)
+    ciphertext, tag = cipher.encrypt_and_digest(raw)
+    payload = {
+        "salt": base64.b64encode(salt).decode("utf-8"),
+        "nonce": base64.b64encode(cipher.nonce).decode("utf-8"),
+        "tag": base64.b64encode(tag).decode("utf-8"),
+        "data": base64.b64encode(ciphertext).decode("utf-8"),
+    }
+    return json.dumps(payload)
 
 def read_qr_from_image(image_path="qrcode.png"):
     if not os.path.exists(image_path):
@@ -15,6 +39,10 @@ def read_qr_from_image(image_path="qrcode.png"):
     if img is None:
         return None
     data, _, _ = detector.detectAndDecode(img)
+    if not data:
+        h, w, _ = img.shape
+        crop = img[int(h*0.3):, :]
+        data, _, _ = detector.detectAndDecode(crop)
     if data:
         try:
             return json.loads(data)
@@ -22,71 +50,57 @@ def read_qr_from_image(image_path="qrcode.png"):
             return None
     return None
 
-def main():
-    print("==================================================")
-    print("🔑 ASSOCIATION OFFICIELLE PRONOTE (SANS RISQUE)")
-    print("==================================================")
-    
-    # 1. Check if image qrcode.png exists
-    qr_data = None
-    if os.path.exists("qrcode.png"):
-        print("📸 Image 'qrcode.png' détectée...")
-        qr_data = read_qr_from_image("qrcode.png")
-        if qr_data:
-            print("✅ QR Code décodé avec succès depuis l'image !")
-
-    # 2. If no image or decode failed, ask for text / JSON
-    if not qr_data:
-        print("\nSi tu as une capture d'écran du QR Code de Pronote :")
-        print("👉 Place l'image nommée 'qrcode.png' dans ce dossier.")
-        print("\nOU scanne le QR code avec ton téléphone et colle le texte ici.")
-        raw_input_text = input("\nColle le texte du QR code (ou appuie sur Entrée si qrcode.png est prêt) : ").strip()
-        
-        if raw_input_text:
-            try:
-                qr_data = json.loads(raw_input_text)
-            except Exception:
-                print("❌ Format de texte invalide. Assure-toi de copier tout le texte du QR Code.")
-                sys.exit(1)
-        else:
-            qr_data = read_qr_from_image("qrcode.png")
-            if not qr_data:
-                print("❌ Impossible de trouver ou lire 'qrcode.png'.")
-                sys.exit(1)
-
-    pin = input("Saisis le code PIN à 4 chiffres défini sur Pronote : ").strip()
-    if len(pin) != 4 or not pin.isdigit():
-        print("❌ Le code PIN doit comporter 4 chiffres.")
-        sys.exit(1)
-
+def pair_qr(qr_data: dict, pin: str):
     device_uuid = str(uuid.uuid4())
-    print("\n⏳ Connexion et génération du jeton officiel auprès de Pronote...")
-
-    try:
-        client = pronotepy.Client.qrcode_login(
-            qr_code=qr_data,
-            pin=pin,
-            uuid=device_uuid,
-            device_name="Apple Calendar Sync"
-        )
-    except Exception as e:
-        print(f"❌ Erreur lors de l'association : {e}")
-        print("Vérifie que le QR code n'a pas expiré (génère-en un nouveau si besoin) et que le PIN est exact.")
-        sys.exit(1)
+    print("⏳ Connexion officielle à Pronote via le jeton mobile...")
+    
+    client = pronotepy.Client.qrcode_login(
+        qr_code=qr_data,
+        pin=pin,
+        uuid=device_uuid,
+        device_name="Apple Calendar Sync"
+    )
 
     if not client.logged_in:
-        print("❌ Échec de connexion.")
-        sys.exit(1)
+        print("❌ Échec de l'association.")
+        return False
 
-    credentials = client.export_credentials()
+    print(f"✅ Association réussie pour {client.info.name} (Classe: {client.info.class_name}) !")
+    creds = client.export_credentials()
+
     with open(CREDENTIALS_FILE, "w", encoding="utf-8") as f:
-        json.dump(credentials, f, indent=2)
+        json.dump(creds, f, indent=2)
 
-    print("\n" + "="*50)
-    print(f"🎉 SUCCÈS ! Appareil associé pour : {client.info.name}")
-    print(f"📁 Jeton sauvegardé dans '{CREDENTIALS_FILE}'")
-    print("Tu n'auras plus JAMAIS besoin de scanner de QR code ni d'entrer ton mot de passe.")
-    print("="*50)
+    # Chiffrer pour GitHub Actions
+    if os.path.exists(".secret_key"):
+        with open(".secret_key", "r") as f:
+            passphrase = f.read().strip()
+        enc = encrypt_data(creds, passphrase)
+        with open(ENCRYPTED_FILE, "w", encoding="utf-8") as f:
+            f.write(enc)
+        print("🔒 Jeton chiffré dans credentials.enc pour GitHub Actions.")
+
+    return True
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) >= 3:
+        # CLI usage: python pair.py <image_or_json> <pin>
+        first_arg = sys.argv[1]
+        pin = sys.argv[2]
+        if os.path.exists(first_arg):
+            qr_data = read_qr_from_image(first_arg)
+        else:
+            qr_data = json.loads(first_arg)
+        if qr_data:
+            pair_qr(qr_data, pin)
+    else:
+        # Interactive
+        qr_data = read_qr_from_image("qrcode.png")
+        if not qr_data:
+            raw = input("Colle le texte du QR code ou chemin de l'image : ").strip()
+            if os.path.exists(raw):
+                qr_data = read_qr_from_image(raw)
+            else:
+                qr_data = json.loads(raw)
+        pin = input("PIN (4 chiffres) : ").strip()
+        pair_qr(qr_data, pin)
