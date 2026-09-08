@@ -1,0 +1,11 @@
+# Secrets
+credentials.json
+*.png
+*.jpg
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
