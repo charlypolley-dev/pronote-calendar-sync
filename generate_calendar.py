@@ -4,24 +4,25 @@ import json
 import os
 import sys
 import warnings
-from icalendar import Calendar, Event
+import zoneinfo
+from icalendar import Calendar, Event, Timezone, TimezoneStandard, TimezoneDaylight
 import pronotepy
 from Crypto.Cipher import AES
 from Crypto.Protocol.KDF import PBKDF2
-from Crypto.Random import get_random_bytes
 
 warnings.filterwarnings("ignore")
 
 CREDENTIALS_FILE = "credentials.json"
 ENCRYPTED_FILE = "credentials.enc"
 SECRET_KEY_ENV = "PRONOTE_SECRET_KEY"
+PARIS_TZ = zoneinfo.ZoneInfo("Europe/Paris")
 
 def derive_key(passphrase: str, salt: bytes) -> bytes:
     return PBKDF2(passphrase, salt, dkLen=32, count=1000)
 
 def encrypt_data(data: dict, passphrase: str) -> str:
     raw = json.dumps(data).encode("utf-8")
-    salt = get_random_bytes(16)
+    salt = os.urandom(16)
     key = derive_key(passphrase, salt)
     cipher = AES.new(key, AES.MODE_GCM)
     ciphertext, tag = cipher.encrypt_and_digest(raw)
@@ -46,8 +47,10 @@ def decrypt_data(encrypted_str: str, passphrase: str) -> dict:
 
 def load_credentials():
     passphrase = os.environ.get(SECRET_KEY_ENV)
-    
-    # 1. From encrypted file
+    if not passphrase and os.path.exists(".secret_key"):
+        with open(".secret_key", "r") as f:
+            passphrase = f.read().strip()
+
     if passphrase and os.path.exists(ENCRYPTED_FILE):
         try:
             with open(ENCRYPTED_FILE, "r", encoding="utf-8") as f:
@@ -55,7 +58,6 @@ def load_credentials():
         except Exception as e:
             print(f"Erreur déchiffrement {ENCRYPTED_FILE}: {e}")
 
-    # 2. From local credentials.json
     if os.path.exists(CREDENTIALS_FILE):
         try:
             with open(CREDENTIALS_FILE, "r", encoding="utf-8") as f:
@@ -66,22 +68,48 @@ def load_credentials():
     return None
 
 def save_credentials(creds: dict):
-    # Save locally
     with open(CREDENTIALS_FILE, "w", encoding="utf-8") as f:
         json.dump(creds, f, indent=2)
 
-    # Save encrypted if passphrase present
     passphrase = os.environ.get(SECRET_KEY_ENV)
+    if not passphrase and os.path.exists(".secret_key"):
+        with open(".secret_key", "r") as f:
+            passphrase = f.read().strip()
+
     if passphrase:
         encrypted = encrypt_data(creds, passphrase)
         with open(ENCRYPTED_FILE, "w", encoding="utf-8") as f:
             f.write(encrypted)
-        print("🔒 Jeton renouvelé et chiffré dans credentials.enc")
+
+def build_vtimezone():
+    tz = Timezone()
+    tz.add('tzid', 'Europe/Paris')
+    tz.add('x-lic-location', 'Europe/Paris')
+
+    # Standard time (CET = UTC+1)
+    tz_standard = TimezoneStandard()
+    tz_standard.add('tzname', 'CET')
+    tz_standard.add('dtstart', datetime.datetime(1971, 10, 31, 3, 0, 0))
+    tz_standard.add('rrule', {'freq': 'yearly', 'bymonth': 10, 'byday': '-1su'})
+    tz_standard.add('tzoffsetfrom', datetime.timedelta(hours=2))
+    tz_standard.add('tzoffsetto', datetime.timedelta(hours=1))
+    tz.add_component(tz_standard)
+
+    # Daylight saving time (CEST = UTC+2)
+    tz_daylight = TimezoneDaylight()
+    tz_daylight.add('tzname', 'CEST')
+    tz_daylight.add('dtstart', datetime.datetime(1971, 3, 28, 2, 0, 0))
+    tz_daylight.add('rrule', {'freq': 'yearly', 'bymonth': 3, 'byday': '-1su'})
+    tz_daylight.add('tzoffsetfrom', datetime.timedelta(hours=1))
+    tz_daylight.add('tzoffsetto', datetime.timedelta(hours=2))
+    tz.add_component(tz_daylight)
+
+    return tz
 
 def main():
     creds = load_credentials()
     if not creds:
-        print("❌ Identifiants introuvables. Lance d'abord pair.py.")
+        print("❌ Identifiants introuvables.")
         sys.exit(1)
 
     print("⏳ Connexion sécurisée à Pronote avec le jeton officiel...")
@@ -97,57 +125,90 @@ def main():
 
     print(f"✅ Connecté : {client.info.name} (Classe : {client.info.class_name})")
 
-    # Mise à jour et persistance immédiate du nouveau jeton renouvelé par Pronote
+    # Mise à jour et rotation du jeton
     updated_creds = client.export_credentials()
     save_credentials(updated_creds)
 
-    # --- CRÉATION DE L'AGENDA APPLE CALENDAR ---
+    # --- CRÉATION DE L'AGENDA APPLE CALENDAR OPTIMISÉ ---
     cal = Calendar()
-    cal.add('prodid', '-//Pronote to Apple Calendar//FR')
+    cal.add('prodid', '-//Pronote to Apple Calendar Sync//FR')
     cal.add('version', '2.0')
+    cal.add('calscale', 'GREGORIAN')
+    cal.add('method', 'PUBLISH')
     cal.add('x-wr-calname', 'Emploi du temps Pronote')
     cal.add('x-wr-timezone', 'Europe/Paris')
+    cal.add('x-wr-caldesc', 'Emploi du temps synchronisé automatiquement depuis Pronote avec gestion des absences.')
+    cal.add_component(build_vtimezone())
 
+    # Plage de dates : du début de l'année scolaire jusqu'à dans 10 semaines (~70 jours)
     today = datetime.date.today()
-    start_date = today - datetime.timedelta(days=today.weekday())
-    end_date = start_date + datetime.timedelta(days=28)
+    start_date = client.start_day if hasattr(client, 'start_day') and client.start_day else (today - datetime.timedelta(days=14))
+    end_date = today + datetime.timedelta(days=70) # 10 semaines dans le futur
 
-    print(f"📅 Récupération des cours du {start_date.strftime('%d/%m')} au {end_date.strftime('%d/%m')}...")
-    lessons = client.lessons(start_date, end_date)
-    print(f"✨ {len(lessons)} cours trouvés.")
+    print(f"📅 Récupération intégrale des cours du {start_date.strftime('%d/%m/%Y')} au {end_date.strftime('%d/%m/%Y')}...")
+    
+    try:
+        lessons = client.lessons(start_date, end_date)
+    except Exception as e:
+        print(f"⚠️ Erreur lors de la récupération : {e}")
+        # Fallback 4 semaines
+        lessons = client.lessons(today - datetime.timedelta(days=7), today + datetime.timedelta(days=28))
+
+    print(f"✨ {len(lessons)} cours récupérés au total.")
 
     canceled_count = 0
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+
     for lesson in lessons:
         event = Event()
-        subject_name = lesson.subject.name if lesson.subject else "Cours"
-        uid_base = lesson.id if lesson.id else f"{lesson.start.isoformat()}-{subject_name}"
-        lesson_uid = f"pronote-{uid_base}@pronote-sync"
         
-        event.add('uid', lesson_uid)
-        event.add('dtstart', lesson.start)
-        event.add('dtend', lesson.end)
-        event.add('dtstamp', datetime.datetime.now())
+        # 1. Gestion des dates avec fuseau horaire explicite Europe/Paris
+        start_dt = lesson.start
+        end_dt = lesson.end
+        
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=PARIS_TZ)
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=PARIS_TZ)
 
+        event.add('dtstart', start_dt)
+        event.add('dtend', end_dt)
+        event.add('dtstamp', now_utc)
+
+        # 2. UID stable et persistant pour qu'Apple Calendar mette à jour sans doublon
+        subj_clean = lesson.subject.name if lesson.subject else "Cours"
+        uid_base = lesson.id if lesson.id else f"{lesson.start.strftime('%Y%m%d%H%M')}-{subj_clean}"
+        lesson_uid = f"pronote-{uid_base}@pronote-sync"
+        event.add('uid', lesson_uid)
+
+        # 3. Formatage du Titre (SUMMARY)
         if lesson.canceled:
             canceled_count += 1
-            event.add('summary', f"❌ [ANNULÉ] {subject_name}")
+            motif_court = f" ({lesson.status})" if lesson.status else ""
+            event.add('summary', f"❌ [ANNULÉ] {subj_clean}{motif_court}")
             event.add('status', 'CANCELLED')
         else:
-            event.add('summary', subject_name)
+            event.add('summary', subj_clean)
             event.add('status', 'CONFIRMED')
 
+        # 4. Lieu / Salle (LOCATION)
+        if lesson.classroom:
+            event.add('location', f"Salle {lesson.classroom}")
+        elif "SPORT" in subj_clean.upper() or "EPS" in subj_clean.upper():
+            event.add('location', "Gymnase / EPS")
+
+        # 5. Description enrichie et lisible (DESCRIPTION)
         desc_lines = []
         if lesson.canceled:
-            motif = lesson.status if lesson.status else "Professeur absent / Cours annulé"
-            desc_lines.append(f"⚠️ STATUT : {motif}")
-        elif lesson.status:
-            desc_lines.append(f"ℹ️ Statut : {lesson.status}")
+            desc_lines.append(f"❌ COURS ANNULÉ")
+            if lesson.status:
+                desc_lines.append(f"⚠️ Motif : {lesson.status}")
+            desc_lines.append("─────────────────────")
 
         if lesson.teacher_names:
             desc_lines.append(f"👨‍🏫 Professeur : {', '.join(lesson.teacher_names)}")
 
         if lesson.classroom:
-            event.add('location', lesson.classroom)
             desc_lines.append(f"📍 Salle : {lesson.classroom}")
 
         if hasattr(lesson, 'group_names') and lesson.group_names:
@@ -156,6 +217,9 @@ def main():
         if hasattr(lesson, 'memo') and lesson.memo:
             desc_lines.append(f"📝 Remarque : {lesson.memo}")
 
+        if lesson.status and not lesson.canceled:
+            desc_lines.append(f"ℹ️ Statut : {lesson.status}")
+
         event.add('description', "\n".join(desc_lines))
         cal.add_component(event)
 
@@ -163,8 +227,8 @@ def main():
     with open(output_path, "wb") as f:
         f.write(cal.to_ical())
 
-    print(f"🎉 Agenda généré avec succès dans '{output_path}' !")
-    print(f"📊 Résumé : {len(lessons)} cours au total, dont {canceled_count} annulé(s)/absent(s).")
+    print(f"🎉 Fichier '{output_path}' généré avec succès !")
+    print(f"📊 Bilan : {len(lessons)} cours (dont {canceled_count} cours annulés).")
 
 if __name__ == "__main__":
     main()
